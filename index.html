@@ -1,0 +1,251 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>文庫ページメーカー</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Shippori+Mincho:wght@400;500&display=swap" rel="stylesheet">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/html2pdf.js/0.10.1/html2pdf.bundle.min.js"></script>
+<style>
+  :root {
+    --ivory: #fffff0;
+    --ink: #2a2a24;
+    --bg: #f5f5f0;
+    --accent: #8b7355;
+    --border: #1a1a1a;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: "Shippori Mincho", "游明朝", "Yu Mincho", serif;
+    background: var(--bg); color: var(--ink);
+    min-height: 100vh; padding: 24px 16px;
+  }
+  h1 {
+    text-align: center; font-size: 1.3rem; font-weight: 500;
+    letter-spacing: 0.15em; margin-bottom: 8px;
+  }
+  .subtitle {
+    text-align: center; font-size: 0.8rem; color: var(--accent);
+    margin-bottom: 32px;
+  }
+  .form { max-width: 600px; margin: 0 auto; }
+  .row { margin-bottom: 16px; }
+  .row label { display: block; font-size: 0.85rem; margin-bottom: 4px; color: var(--accent); }
+  .row input, .row textarea {
+    width: 100%; padding: 10px 12px; border: 1px solid #ccc;
+    font-family: inherit; font-size: 1rem; background: #fff;
+    border-radius: 2px;
+  }
+  .row input:focus, .row textarea:focus { outline: 2px solid var(--accent); border-color: transparent; }
+  #text { height: 50vh; min-height: 200px; resize: vertical; line-height: 1.8; }
+  .actions { text-align: center; margin-top: 24px; }
+  #generate {
+    font-family: inherit; font-size: 1rem; padding: 12px 48px;
+    background: var(--ink); color: var(--ivory); border: none;
+    letter-spacing: 0.2em; cursor: pointer; border-radius: 2px;
+  }
+  #generate:hover { background: #444; }
+  #generate:disabled { opacity: 0.4; cursor: wait; }
+  #status {
+    text-align: center; margin-top: 16px; font-size: 0.85rem; color: var(--accent);
+    min-height: 1.5em;
+  }
+  /* PDF rendering area — off-screen */
+  #render-area {
+    position: fixed; left: -9999px; top: 0;
+  }
+  .page {
+    width: 794px; height: 1123px;
+    background: var(--ivory); border: 1px solid var(--border);
+    position: relative; overflow: hidden;
+  }
+  .body-text {
+    writing-mode: vertical-rl; text-orientation: mixed;
+    font-family: "Shippori Mincho", "游明朝", "Yu Mincho", serif;
+    font-size: 11pt; line-height: 1.67; letter-spacing: 0.05em;
+    line-break: strict; word-break: normal;
+    white-space: pre-wrap;
+    position: absolute; top: 70px; right: 60px;
+    width: 600px; height: 900px;
+    overflow: hidden; color: var(--ink);
+  }
+  .page-number {
+    position: absolute; left: 70px; bottom: 28px;
+    font-size: 9pt; color: var(--ink);
+  }
+  .page-header {
+    writing-mode: vertical-rl; text-orientation: mixed;
+    position: absolute; top: 18px; left: 70px;
+    font-size: 7.5pt; color: #888; letter-spacing: 0.1em;
+  }
+</style>
+</head>
+<body>
+
+<h1>文庫ページメーカー</h1>
+<p class="subtitle">テキストを貼って縦書きPDFを生成</p>
+
+<div class="form">
+  <div class="row">
+    <label for="title-input">タイトル</label>
+    <input id="title-input" type="text" placeholder="作品タイトル">
+  </div>
+  <div class="row">
+    <label for="author-input">著者名</label>
+    <input id="author-input" type="text" placeholder="ペンネーム">
+  </div>
+  <div class="row">
+    <label for="text">本文</label>
+    <textarea id="text" placeholder="小説のテキストをここに貼り付けてください。&#10;&#10;段落は改行で区切ります。&#10;「台詞はカギ括弧で始めると字下げされません」"></textarea>
+  </div>
+  <div class="actions">
+    <button id="generate">生成する</button>
+  </div>
+  <div id="status"></div>
+</div>
+
+<div id="render-area"></div>
+
+<script>
+// ── A5 layout constants ──
+// Page: 560×794px (≈148mm×210mm at 96dpi)
+// Text block: 458×661px (≈121mm×175mm)
+// Font: 11pt, line-height 1.67, letter-spacing 0.05em
+// → 42 chars × 18 columns per page
+const CHARS_PER_COL = 58;
+const COLS_PER_PAGE = 24;
+
+// 行頭禁則文字
+const KINSOKU = new Set(
+  '」』）】〉》〕〙〗］｝〟、。，．・：；？！ヽヾゝゞ々〜ーぁぃぅぇぉっゃゅょゎァィゥェォッャュョヮ'
+);
+
+function paginate(text) {
+  // 改行で段落分割
+  const rawParas = text.split(/\n/).filter(p => p.trim());
+  const paragraphs = rawParas.map(p => {
+    const t = p.trim();
+    // 「で始まる行（台詞）は字下げしない、それ以外は全角スペース1つ
+    return t.startsWith('「') ? t : '　' + t;
+  });
+
+  const pages = [];
+  let current = [];
+  let usedCols = 0;
+
+  for (const para of paragraphs) {
+    const cols = Math.max(1, Math.ceil(para.length / CHARS_PER_COL));
+
+    if (current.length > 0 && usedCols + cols > COLS_PER_PAGE) {
+      pages.push(current.join('\n'));
+      current = [];
+      usedCols = 0;
+    }
+
+    // 1段落がページを超える場合は分割
+    if (cols > COLS_PER_PAGE && current.length === 0) {
+      const charsPerPage = CHARS_PER_COL * COLS_PER_PAGE;
+      for (let i = 0; i < para.length; i += charsPerPage) {
+        pages.push(para.slice(i, i + charsPerPage));
+      }
+      continue;
+    }
+
+    current.push(para);
+    usedCols += cols;
+  }
+  if (current.length > 0) pages.push(current.join('\n'));
+  return pages;
+}
+
+function escapeHtml(s) {
+  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+function buildPages(text, title, author) {
+  const pages = paginate(text);
+  const area = document.getElementById('render-area');
+  area.innerHTML = '';
+
+  const wrapper = document.createElement('div');
+  wrapper.id = 'pdf-content';
+
+  pages.forEach((pageText, i) => {
+    const pageDiv = document.createElement('div');
+    pageDiv.className = 'page';
+    if (i > 0) pageDiv.style.pageBreakBefore = 'always';
+
+    // 柱（タイトル）
+    if (title) {
+      const header = document.createElement('div');
+      header.className = 'page-header';
+      header.textContent = title;
+      pageDiv.appendChild(header);
+    }
+
+    // 本文
+    const body = document.createElement('div');
+    body.className = 'body-text';
+    body.innerHTML = escapeHtml(pageText);
+    pageDiv.appendChild(body);
+
+    // ノンブル
+    const pnum = document.createElement('div');
+    pnum.className = 'page-number';
+    pnum.textContent = i + 1;
+    pageDiv.appendChild(pnum);
+
+    wrapper.appendChild(pageDiv);
+  });
+
+  area.appendChild(wrapper);
+  return { pageCount: pages.length, wrapper };
+}
+
+async function generatePdf() {
+  const btn = document.getElementById('generate');
+  const status = document.getElementById('status');
+  const text = document.getElementById('text').value.trim();
+  const title = document.getElementById('title-input').value.trim();
+  const author = document.getElementById('author-input').value.trim();
+
+  if (!text) {
+    status.textContent = '本文を入力してください';
+    return;
+  }
+
+  btn.disabled = true;
+  status.textContent = 'ページを組んでいます…';
+
+  // フォント読み込み待ち
+  await document.fonts.ready;
+
+  const { pageCount, wrapper } = buildPages(text, title, author);
+  status.textContent = `${pageCount}ページ — PDF生成中…`;
+
+  const filename = (title || '文庫') + '.pdf';
+
+  try {
+    await html2pdf().set({
+      margin: 0,
+      filename,
+      image: { type: 'jpeg', quality: 0.95 },
+      html2canvas: { scale: 3, useCORS: true, backgroundColor: '#fffff0' },
+      jsPDF: { unit: 'mm', format: 'a4', orientation: 'portrait' },
+      pagebreak: { mode: ['css'] }
+    }).from(wrapper).save();
+
+    status.textContent = `${pageCount}ページのPDFを保存しました`;
+  } catch (e) {
+    status.textContent = 'PDF生成に失敗しました: ' + e.message;
+    console.error(e);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+document.getElementById('generate').addEventListener('click', generatePdf);
+</script>
+</body>
+</html>
